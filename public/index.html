@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FreteLab - Análise de Fretes</title>
+  <link rel="icon" type="image/png" href="/static/img/fretelab-icon.png" />
+  <link rel="stylesheet" href="/static/css/app.css" />
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="top-left">
+        <div class="top-brand">
+          <button class="brand-admin-trigger" id="adminLoginTrigger" type="button" title="Ativar modo ADM" aria-label="Ativar modo ADM">
+            <img class="brand-mark" src="/static/img/fretelab-icon.png" alt="FreteLab" />
+          </button>
+          <div>
+            <strong>FreteLab</strong>
+            <span>Análises locais</span>
+          </div>
+        </div>
+        <nav class="top-nav" aria-label="Principal">
+          <button class="nav-item active" data-page="home">Home</button>
+          <button class="nav-item" data-page="nova">Análise</button>
+          <button class="nav-item" data-page="historico">Histórico</button>
+          <details class="top-dropdown">
+            <summary>Configurações</summary>
+            <div class="dropdown-menu">
+              <button class="nav-item" data-page="bases">Resumo da Base</button>
+              <button class="nav-item" data-page="arquivadas">Análises Arquivadas</button>
+              <button class="nav-item" data-page="vigentes">Contratos Vigentes</button>
+              <button class="nav-item" data-page="pedidos">Pedidos</button>
+              <button class="nav-item" data-page="negociacoes">Contratos Negociações</button>
+              <button class="nav-item" data-page="regioes">Regiões Logísticas</button>
+              <button class="nav-item" data-page="config">Configurações Gerais</button>
+            </div>
+          </details>
+        </nav>
+      </div>
+      <div class="top-actions">
+        <div class="top-status" id="topStatus">Inicializando...</div>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="page active" id="page-home">
+        <div class="page-head hero-head">
+          <div>
+            <p class="eyebrow">Home</p>
+            <h1>Visão executiva de fretes</h1>
+            <p class="page-subtitle">Indicadores estratégicos do histórico, oportunidades de economia e principais pontos de atenção.</p>
+          </div>
+          <div class="actions">
+            <button data-page="nova">Nova análise</button>
+            <button class="secondary" data-action="refresh-history">Atualizar dados</button>
+          </div>
+        </div>
+        <section class="home-hero panel">
+          <div class="home-hero-copy">
+            <p class="eyebrow">Resumo estratégico</p>
+            <h2>Compare custo, prazo e oportunidade antes de decidir.</h2>
+            <p>Use a Home para acompanhar a evolução das análises salvas, identificar transportadoras competitivas e priorizar regiões ou CEPs com maior custo médio.</p>
+          </div>
+          <div class="home-score" id="homeOptimizationScore">
+            <span>Otimização</span>
+            <strong>-</strong>
+            <em>sem histórico</em>
+          </div>
+        </section>
+        <section class="home-grid">
+          <div class="panel home-kpis">
+            <div class="panel-head"><h2>Indicadores principais</h2><span class="muted" id="homeUpdatedAt">-</span></div>
+            <div class="kpi-grid executive-kpis" id="homeKpis"></div>
+          </div>
+          <div class="panel home-opportunities">
+            <div class="panel-head"><h2>Oportunidades e alertas</h2><span class="badge">insights</span></div>
+            <div id="homeInsights" class="insight-list"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>Ranking de transportadoras</h2><span class="muted">custo médio</span></div>
+            <div id="homeCarrierRanking" class="ranking-list"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>CEPs/regiões com maior custo</h2><span class="muted">priorização</span></div>
+            <div id="homeHighCostLocations" class="ranking-list"></div>
+          </div>
+          <div class="panel home-recent">
+            <div class="panel-head"><h2>Análises recentes</h2><button class="secondary" data-page="historico">Ver histórico</button></div>
+            <div id="homeRecent" class="analysis-list compact-list"></div>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-nova">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Análise</p>
+            <h1>COMPARATIVO TRANSPORTADORAS</h1>
+            <p class="page-subtitle">Gere análises por CEP, replique cenários e salve automaticamente no histórico.</p>
+          </div>
+        </div>
+
+        <div class="analysis-layout">
+          <aside class="filters-sidebar">
+            <details class="filter-drawer" open>
+              <summary>Parâmetros da análise</summary>
+              <section class="panel filters-panel">
+                <div class="parameter-session">
+                  <span>Sessão de análise</span>
+                  <strong id="activeParamTitle">Análise 1</strong>
+                </div>
+                <div class="metadata-grid">
+                  <label>Data da análise
+                    <input id="analysisDateInput" readonly />
+                  </label>
+                  <label>Nome da análise
+                    <input id="analysisNameInput" />
+                  </label>
+                  <label>Responsável
+                    <input id="analysisResponsibleInput" placeholder="Nome do responsável" />
+                  </label>
+                </div>
+                <div class="divider"></div>
+                <div id="parameterInstances" class="parameter-instances"></div>
+                <label>CEP
+                  <input id="cepLookupInput" inputmode="numeric" maxlength="8" placeholder="05000000" />
+                </label>
+                <div class="divider"></div>
+                <div class="form-grid single-column">
+                  <label>Região Logística
+                    <select id="logisticsRegionSelect"></select>
+                  </label>
+                  <label>UF
+                    <select id="ufSelect"></select>
+                  </label>
+                  <label>Municipio
+                    <select id="municipioSelect"></select>
+                  </label>
+                  <label>ESTB
+                    <select id="estbSelect"></select>
+                  </label>
+                </div>
+                <div class="divider"></div>
+                <label>Transportadora principal
+                  <select id="mainCarrier"></select>
+                </label>
+                <div class="secondary-block">
+                  <div class="panel-head">
+                    <h3>Transportadoras secundárias</h3>
+                    <button class="secondary" type="button" id="btnAddSecondary">Adicionar secundária</button>
+                  </div>
+                  <div id="secondarySlots" class="secondary-slots"></div>
+                </div>
+                <div class="notice" id="cepNotice">Digite um CEP para carregar localidade, transportadoras e faixas.</div>
+                <div class="param-actions">
+                  <button type="button" id="btnRunAnalysis">Gerar análise</button>
+                  <button class="secondary" type="button" id="btnReuseSelection">Replicar para outro CEP</button>
+                </div>
+              </section>
+            </details>
+          </aside>
+
+          <section class="results-area">
+            <section class="panel result-panel" id="resultPanel" hidden>
+              <div class="panel-head">
+                <h2>Resultados da sessão</h2>
+                <span class="muted" id="resultCount">Nenhuma análise gerada</span>
+              </div>
+              <div id="resultCards" class="result-cards"></div>
+            </section>
+          </section>
+        </div>
+
+        <section class="panel export-panel" id="sessionExportPanel">
+          <div>
+            <p class="eyebrow">Fechamento</p>
+            <h2>Geração de arquivos da sessão</h2>
+            <p>Gere um relatório consolidado com todos os resultados criados nesta página.</p>
+          </div>
+          <div class="actions">
+            <button class="secondary" id="btnExportSessionPdf">Gerar PDF consolidado</button>
+            <button class="secondary" id="btnExportSessionHtml">Gerar HTML consolidado</button>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-bases">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Dados</p>
+            <h1>Resumo da base</h1>
+          </div>
+          <button class="secondary" id="btnPreviewRefresh">Atualizar preview</button>
+        </div>
+        <section class="panel">
+          <div class="kpi-grid" id="fileKpis"></div>
+        </section>
+        <section class="panel">
+          <div class="form-grid">
+            <label>Tipo da tabela
+              <select id="previewKind">
+                <option value="contratos_vigentes">Contratos Vigentes</option>
+                <option value="pedidos">Pedidos</option>
+                <option value="contratos_negociacoes">Contratos Negociações</option>
+                <option value="regioes_logisticas">Regiões Logísticas</option>
+              </select>
+            </label>
+            <label>Filtro
+              <input id="previewFilter" placeholder="Digite para filtrar qualquer coluna" />
+            </label>
+          </div>
+          <div class="notice" id="previewMeta">Selecione uma tabela para pré-visualizar.</div>
+          <div class="table-wrap preview-table-wrap">
+            <table id="previewTable"></table>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-historico">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Histórico</p>
+            <h1>Análises salvas</h1>
+          </div>
+          <button class="secondary" data-action="refresh-history">Atualizar</button>
+        </div>
+        <section class="panel history-filters">
+          <div class="form-grid">
+            <label>Data
+              <input id="historyFilterDate" placeholder="DD/MM/AAAA" />
+            </label>
+            <label>Nome da análise
+              <input id="historyFilterName" placeholder="Buscar por nome" />
+            </label>
+            <label>Responsável
+              <input id="historyFilterResponsible" placeholder="Buscar por responsável" />
+            </label>
+            <label>CEP
+              <input id="historyFilterCep" inputmode="numeric" placeholder="Buscar por CEP" />
+            </label>
+            <label>Transportadora
+              <input id="historyFilterCarrier" placeholder="Principal ou secundária" />
+            </label>
+            <label>Melhor transportadora
+              <input id="historyFilterBestCarrier" placeholder="Melhor custo ou prazo" />
+            </label>
+            <label>Status
+              <select id="historyFilterStatus">
+                <option value="">Todos</option>
+                <option value="economia">Economia potencial</option>
+                <option value="melhor custo">Melhor custo</option>
+                <option value="menor prazo">Menor prazo</option>
+                <option value="custo x prazo">Custo x prazo</option>
+              </select>
+            </label>
+          </div>
+        </section>
+        <div id="historyList" class="analysis-list"></div>
+      </section>
+
+      <section class="page" id="page-arquivadas">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Arquivo</p>
+            <h1>Análises arquivadas</h1>
+          </div>
+        </div>
+        <div id="archivedList" class="analysis-list"></div>
+      </section>
+
+      <section class="page" id="page-vigentes">
+        <div class="page-head"><div><p class="eyebrow">Entrada</p><h1>Contratos Vigentes</h1></div></div>
+        <div id="vigentesFiles" class="file-page"></div>
+      </section>
+
+      <section class="page" id="page-pedidos">
+        <div class="page-head"><div><p class="eyebrow">Entrada</p><h1>Pedidos</h1></div></div>
+        <div id="pedidosFiles" class="file-page"></div>
+      </section>
+
+      <section class="page" id="page-negociacoes">
+        <div class="page-head"><div><p class="eyebrow">Entrada manual</p><h1>Contratos Negociações</h1></div></div>
+        <div class="notice">Inclua arquivos manualmente na pasta <span class="mono">input/contratos_negociacoes</span> e atualize a tela.</div>
+        <div id="negociacoesFiles" class="file-page"></div>
+      </section>
+
+      <section class="page" id="page-regioes">
+        <div class="page-head"><div><p class="eyebrow">Apoio</p><h1>Regiões Logísticas</h1></div></div>
+        <div class="notice">Esta base centraliza a Região Logística usada nos filtros. Quando uma mesma chave <span class="mono">UF - Localidade</span> possui mais de uma faixa, a coluna <span class="mono">Tipo</span> classifica como <span class="mono">FAIXA 1</span>, <span class="mono">FAIXA 2</span> e assim por diante.</div>
+        <div id="regioesFiles" class="file-page"></div>
+      </section>
+
+      <section class="page" id="page-config">
+        <div class="page-head">
+          <div>
+            <p class="eyebrow">Configurações</p>
+            <h1>Campos, regras e pesos</h1>
+          </div>
+          <button class="secondary" id="btnResetConfig">Restaurar padrão</button>
+        </div>
+        <div class="config-grid">
+          <section class="panel">
+            <h2>Pesos e regras</h2>
+            <div class="form-grid">
+              <label>Peso inicial <input id="cfgStart" type="number" min="1" value="20" /></label>
+              <label>Peso final <input id="cfgEnd" type="number" min="1" value="200" /></label>
+              <label>Passo <input id="cfgStep" type="number" min="1" value="20" /></label>
+              <label>Valor da nota <input id="cfgNota" type="number" min="0" step="0.01" value="1000" /></label>
+            </div>
+            <div class="toggles">
+              <label><input id="cfgAddFixed" type="checkbox" checked /> Somar fixos</label>
+              <label><input id="cfgAddPerc" type="checkbox" /> Somar percentuais</label>
+              <label><input id="cfgApplyMin" type="checkbox" /> Aplicar frete minimo</label>
+            </div>
+          </section>
+          <section class="panel">
+            <h2>Campos de cálculo</h2>
+            <label>Fixos
+              <textarea id="cfgFixed"></textarea>
+            </label>
+            <label>Percentuais
+              <textarea id="cfgPerc"></textarea>
+            </label>
+          </section>
+          <section class="panel">
+            <h2>Mapeamento de contratos</h2>
+            <div class="form-grid">
+              <label>Nome <input id="colNome" value="NOME" /></label>
+              <label>ID <input id="colId" value="ID INTELIPOST" /></label>
+              <label>Estoque <input id="colEstoque" value="ESTOQUE" /></label>
+              <label>Cidade <input id="colCidade" value="CIDADE" /></label>
+              <label>UF <input id="colUf" value="UF" /></label>
+              <label>CEP inicial <input id="colCepIni" value="CEPI" /></label>
+              <label>CEP final <input id="colCepFim" value="CEPF" /></label>
+              <label>IBGE inicial <input id="colIbgeIni" placeholder="opcional" /></label>
+              <label>IBGE final <input id="colIbgeFim" placeholder="opcional" /></label>
+              <label>IBGE unico <input id="colIbge" placeholder="opcional" /></label>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div class="toast" id="toast" hidden></div>
+  <script src="/static/js/app.js" defer></script>
+</body>
+</html>
