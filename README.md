@@ -1,8 +1,8 @@
 # FreteLab - Analise de Fretes
 
-Aplicacao local para analise de frete por CEP, cidade, codigo IBGE, faixas de peso e generalidades contratuais.
+Aplicacao para analise de frete por CEP, cidade, codigo IBGE, faixas de peso e generalidades contratuais. Em producao na Vercel, dados estruturados ficam no Supabase Postgres e arquivos ficam no Vercel Blob.
 
-## Pastas de entrada
+## Pastas de entrada local
 
 ```text
 input/
@@ -15,7 +15,7 @@ input/
 
 Arquivos aceitos: `.sqlite`, `.db`, `.xlsx`, `.xls` e `.csv`.
 
-A base principal deve ficar em `input/contratos_vigentes`. O arquivo atual foi convertido para `input/contratos_vigentes/dados.sqlite`, e o Excel original foi preservado em `input/contratos_vigentes/origem/dados.xlsx` apenas para auditoria.
+A base principal local pode ficar em `input/contratos_vigentes`. Na Vercel, use o modo ADM para registrar a base ativa no Supabase e armazenar os arquivos no Vercel Blob.
 
 Padrao recomendado para producao na VM Ubuntu:
 
@@ -56,7 +56,7 @@ executar.bat
 
 1. Coloque os contratos vigentes em `input/contratos_vigentes`.
 2. Coloque o historico de pedidos em `input/pedidos`.
-3. Coloque negociacoes em `input/contratos_negociacoes` quando houver.
+3. Em producao, cadastre negociacoes pelo modo ADM; localmente, tambem e possivel usar `input/contratos_negociacoes`.
 4. Abra a aplicacao e confira a `Home`, as paginas de entrada e o `Resumo da Base`.
 5. Em `Analise`, informe CEP, confirme Regiao Logistica, UF, Municipio e ESTB, escolha a transportadora principal e as secundarias.
 6. Gere a analise. Ela sera salva automaticamente no historico.
@@ -85,7 +85,7 @@ A pagina de Analise exibe cards executivos por CEP, ranking de transportadoras, 
 A aplicacao tenta resolver cidade, UF e codigo IBGE do CEP por esta ordem:
 
 1. Base local em `input/cep_ibge`.
-2. Cache local em `storage/cep_cache.json`.
+2. Cache em `app_settings` no Supabase quando `DATABASE_URL` existir, ou cache local em `storage/cep_cache.json` apenas em desenvolvimento.
 3. Consulta BrasilAPI.
 4. Fallback por contratos, quando necessario.
 
@@ -100,7 +100,7 @@ A base em `input/regioes_logisticas` alimenta o filtro de Regiao Logistica e tam
 
 ## Historico
 
-As analises ficam em:
+Em producao, as analises ficam na tabela `analyses` do Supabase. Em desenvolvimento sem `DATABASE_URL`, o fallback local continua em:
 
 ```text
 storage/analises/
@@ -116,11 +116,15 @@ Cada nova geracao cria um arquivo novo. Versoes antigas nao sao sobrescritas.
 - `MAX_UPLOAD_MB`: padrao `30`
 - `FRETELAB_ADMIN_PASSWORD`: senha para ativar o modo ADM no icone FreteLab
 - `FRETELAB_SECRET_KEY`: chave de sessao Flask recomendada para producao
+- `DATABASE_URL`: conexao Postgres do Supabase para historico, bases e auditoria
+- `BLOB_READ_WRITE_TOKEN`: token do Vercel Blob para arquivos ADM, backups e exports opcionais
 
 ## Logs
 
-Mensagens tecnicas ficam em:
+Localmente, mensagens tecnicas ficam em:
 
 ```text
 logs/frete_app.log
 ```
+
+Na Vercel, logs devem ir para stdout/stderr do runtime. Veja `DEPLOY_DATABASE_STORAGE.md` para o fluxo completo de banco, storage, migracao e deploy.
