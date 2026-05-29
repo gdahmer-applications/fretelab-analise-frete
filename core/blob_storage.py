@@ -3,7 +3,6 @@ from __future__ import annotations
 import mimetypes
 import os
 from dataclasses import dataclass
-from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -57,7 +56,8 @@ def _client():
         from vercel.blob import BlobClient
     except ImportError as exc:
         raise BlobNotConfigured("Dependencia vercel nao instalada.") from exc
-    return BlobClient(token=require_blob_token())
+    require_blob_token()
+    return BlobClient()
 
 
 def _value(data: Any, *names: str, default: Any = "") -> Any:
@@ -72,7 +72,7 @@ def _value(data: Any, *names: str, default: Any = "") -> Any:
 def upload_bytes(pathname: str, data: bytes, content_type: str | None = None) -> BlobUpload:
     guessed = content_type or mimetypes.guess_type(pathname)[0] or "application/octet-stream"
     client = _client()
-    result = client.put(pathname, BytesIO(data), access="private", content_type=guessed, add_random_suffix=False)
+    result = client.put(pathname, data, access="private", content_type=guessed, add_random_suffix=False)
     return BlobUpload(
         pathname=str(_value(result, "pathname", default=pathname)),
         url=str(_value(result, "url", default="")),

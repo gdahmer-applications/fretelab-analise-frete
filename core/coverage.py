@@ -11,12 +11,14 @@ from typing import Any
 
 import pandas as pd
 
+from . import db
 from .normalization import get_cell, parse_cep, parse_ibge, safe_json_value, to_number
 from .repository import load_dataset
 from .settings import ANALISES_DIR
 from .validation import resolve_contract_columns
 
 CACHE_PATH = ANALISES_DIR.parent / "cep_cache.json"
+CACHE_SETTING_KEY = "cep_cache"
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,18 @@ class CepInfo:
 
 
 def _load_cache() -> dict[str, Any]:
+    if db.database_configured():
+        try:
+            with db.connection(row_factory=db.dict_row_factory()) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("select value_json from app_settings where key = %s", (CACHE_SETTING_KEY,))
+                    row = cur.fetchone()
+            value = row.get("value_json") if row else {}
+            return value if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+    if db.is_vercel_runtime():
+        return {}
     try:
         return json.loads(CACHE_PATH.read_text(encoding="utf-8"))
     except Exception:
@@ -47,6 +61,26 @@ def _load_cache() -> dict[str, Any]:
 
 
 def _save_cache(cache: dict[str, Any]) -> None:
+    if db.database_configured():
+        try:
+            with db.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        insert into app_settings (key, value_json, updated_by)
+                        values (%s, %s, %s)
+                        on conflict (key)
+                        do update set value_json = excluded.value_json,
+                                      updated_at = now(),
+                                      updated_by = excluded.updated_by
+                        """,
+                        (CACHE_SETTING_KEY, db.jsonb(cache), "system"),
+                    )
+        except Exception:
+            pass
+        return
+    if db.is_vercel_runtime():
+        return
     CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
     CACHE_PATH.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
 

@@ -200,3 +200,26 @@ def audit(action: str, entity_type: str, entity_id: str | None, details: dict[st
                 """,
                 (action, entity_type, entity_id, db.jsonb(details), "admin_env", ip_address),
             )
+
+
+def delete_active_dataset(kind: str, ip_address: str | None = None) -> dict[str, Any]:
+    with db.connection(row_factory=db.dict_row_factory()) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select dataset_version_id from dataset_active_versions where kind = %s",
+                (kind,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise FileNotFoundError("Base ativa nao encontrada.")
+            version_id = row["dataset_version_id"]
+            cur.execute("update dataset_versions set status = 'deleted' where id = %s", (version_id,))
+            cur.execute("delete from dataset_active_versions where kind = %s", (kind,))
+            cur.execute(
+                """
+                insert into admin_audit_logs (action, entity_type, entity_id, details_json, created_by, ip_address)
+                values (%s, %s, %s, %s, %s, %s)
+                """,
+                ("dataset.delete_active", "dataset_version", version_id, db.jsonb({"kind": kind}), "admin_env", ip_address),
+            )
+    return {"ok": True, "deleted": kind, "versionId": version_id}

@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import secrets
 import sqlite3
+import tempfile
 
 from flask import Flask, abort, request, send_file, send_from_directory, session
 from openpyxl import Workbook
@@ -17,6 +18,7 @@ from openpyxl.utils import get_column_letter
 import pandas as pd
 
 from core.analysis_engine import available_carriers, available_carriers_by_location, generate_analysis, location_options, resolve_location_from_cep
+from core import blob_storage, dataset_repository, db
 from core.exporter import build_analysis_pdf, build_final_html, build_final_pdf
 from core.history import delete_analysis, list_analyses, load_analysis, set_archived
 from core.importer import load_xlsx_dataset
@@ -29,7 +31,8 @@ from core.validation import resolve_contract_columns, validate_contracts, valida
 from utils.export_files import build_pdf_bytes, build_xlsx_bytes
 
 ensure_directories()
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+if os.getenv("VERCEL") != "1":
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_local_env() -> None:
@@ -63,15 +66,24 @@ DATASET_SQLITE_NAMES = {
 }
 CONTRACT_TEMPLATE_PATH = BASE_DIR / "input" / "templates" / "template_contratos_fretelab.xlsx"
 
-logging.basicConfig(
-    filename=str(LOGS_DIR / "frete_app.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+if os.getenv("VERCEL") == "1":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+else:
+    logging.basicConfig(
+        filename=str(LOGS_DIR / "frete_app.log"),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 
 def json_error(message: str, status: int = 400):
     return {"error": message}, status
+
+
+def persistence_error(exc: Exception):
+    if isinstance(exc, (db.PersistenceNotConfigured, blob_storage.BlobNotConfigured)):
+        return json_error(str(exc), 503)
+    return json_error(str(exc), 400)
 
 
 def is_admin() -> bool:
@@ -82,6 +94,22 @@ def require_admin():
     if not is_admin():
         return json_error("Modo ADM necessario para esta operacao.", 403)
     return None
+
+
+def require_dataset_persistence() -> bool:
+    if db.database_configured():
+        if not blob_storage.blob_configured():
+            raise blob_storage.BlobNotConfigured("BLOB_READ_WRITE_TOKEN nao configurado para persistir arquivos.")
+        return True
+    if db.is_vercel_runtime():
+        raise db.PersistenceNotConfigured("DATABASE_URL nao configurado; manutencao ADM persistente indisponivel.")
+    return False
+
+
+def tmp_workspace(kind: str, timestamp: str) -> Path:
+    root = Path(tempfile.gettempdir()) / "fretelab" / kind / timestamp
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def dataset_directory(kind: str) -> Path:
@@ -144,6 +172,135 @@ def convert_xlsx_to_sqlite(source: Path, target: Path, kind: str) -> None:
     safe_unlink(target)
     df = load_xlsx_dataset(source, kind)
     write_dataset_sqlite(df, target, kind, source.name)
+
+
+def upload_and_register_file(
+    path: Path,
+    *,
+    purpose: str,
+    dataset_kind: str | None,
+    original_filename: str,
+    content_type: str,
+    blob_folder: str,
+) -> str:
+    pathname = blob_storage.blob_path(blob_folder, blob_storage.safe_blob_name(path.name))
+    blob_info = blob_storage.upload_path(path, pathname, content_type=content_type).as_dict()
+    return dataset_repository.register_uploaded_file(
+        purpose=purpose,
+        dataset_kind=dataset_kind,
+        original_filename=original_filename,
+        content_type=content_type,
+        size_bytes=path.stat().st_size,
+        blob_info=blob_info,
+    )
+
+
+def persist_dataset_upload(kind: str, upload, *, mode: str, current_df: pd.DataFrame | None = None) -> dict[str, object]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    workspace = tmp_workspace(kind, timestamp)
+    safe_name = blob_storage.safe_blob_name(upload.filename or f"{kind}.xlsx")
+    upload_temp = workspace / safe_name
+    sqlite_temp = workspace / DATASET_SQLITE_NAMES[kind]
+    upload.save(upload_temp)
+
+    new_df = load_xlsx_dataset(upload_temp, kind)
+    if current_df is not None and not current_df.empty:
+        final_df = pd.concat([current_df, new_df], ignore_index=True, sort=False)
+    else:
+        final_df = new_df
+
+    write_dataset_sqlite(final_df, sqlite_temp, kind, safe_name)
+    validate_sqlite_file(sqlite_temp)
+
+    source_file_id = upload_and_register_file(
+        upload_temp,
+        purpose="dataset_original",
+        dataset_kind=kind,
+        original_filename=safe_name,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        blob_folder=blob_storage.blob_path("datasets", "original", kind),
+    )
+    sqlite_file_id = upload_and_register_file(
+        sqlite_temp,
+        purpose="dataset_sqlite_backup",
+        dataset_kind=kind,
+        original_filename=sqlite_temp.name,
+        content_type="application/vnd.sqlite3",
+        blob_folder=blob_storage.blob_path("datasets", "sqlite", kind),
+    )
+    version_id = dataset_repository.create_dataset_version(
+        kind=kind,
+        df=final_df,
+        source_file_id=source_file_id,
+        sqlite_file_id=sqlite_file_id,
+        version_label=f"{kind}_{timestamp}",
+        metadata={"mode": mode, "source_file": safe_name, "rows_added": int(len(new_df))},
+    )
+    dataset_repository.audit(
+        f"dataset.{mode}",
+        "dataset_version",
+        version_id,
+        {"kind": kind, "sourceFileId": source_file_id, "sqliteFileId": sqlite_file_id, "rows": int(len(final_df))},
+        request.remote_addr,
+    )
+    clear_dataset_cache()
+    return {
+        "ok": True,
+        "kind": kind,
+        "file": DATASET_SQLITE_NAMES[kind],
+        "source": safe_name,
+        "versionId": version_id,
+        "addedRows": int(len(new_df)),
+        "totalRows": int(len(final_df)),
+    }
+
+
+def persist_dataset_dataframe(kind: str, df: pd.DataFrame, *, mode: str, metadata: dict[str, object]) -> dict[str, object]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    workspace = tmp_workspace(kind, timestamp)
+    sqlite_temp = workspace / DATASET_SQLITE_NAMES[kind]
+    write_dataset_sqlite(df, sqlite_temp, kind, mode)
+    validate_sqlite_file(sqlite_temp)
+    sqlite_file_id = upload_and_register_file(
+        sqlite_temp,
+        purpose="dataset_sqlite_backup",
+        dataset_kind=kind,
+        original_filename=sqlite_temp.name,
+        content_type="application/vnd.sqlite3",
+        blob_folder=blob_storage.blob_path("datasets", "sqlite", kind),
+    )
+    version_id = dataset_repository.create_dataset_version(
+        kind=kind,
+        df=df,
+        source_file_id=None,
+        sqlite_file_id=sqlite_file_id,
+        version_label=f"{kind}_{timestamp}",
+        metadata={"mode": mode, **metadata},
+    )
+    dataset_repository.audit(
+        f"dataset.{mode}",
+        "dataset_version",
+        version_id,
+        {"kind": kind, "sqliteFileId": sqlite_file_id, **metadata},
+        request.remote_addr,
+    )
+    clear_dataset_cache()
+    return {"ok": True, "kind": kind, "file": DATASET_SQLITE_NAMES[kind], "versionId": version_id}
+
+
+def save_export_to_blob(name: str, content: bytes, content_type: str, analysis_id: str | None = None) -> None:
+    if not (db.database_configured() and blob_storage.blob_configured()):
+        return
+    pathname = blob_storage.blob_path("exports", analysis_id or "session", blob_storage.safe_blob_name(name))
+    blob_info = blob_storage.upload_bytes(pathname, content, content_type=content_type).as_dict()
+    dataset_repository.register_uploaded_file(
+        purpose="analysis_export",
+        dataset_kind=None,
+        original_filename=name,
+        content_type=content_type,
+        size_bytes=len(content),
+        blob_info=blob_info,
+    )
 
 
 def safe_unlink(path: Path) -> None:
@@ -298,6 +455,18 @@ def admin_download_dataset(kind: str, filename: str):
     blocked = require_admin()
     if blocked:
         return blocked
+    if db.database_configured():
+        df, files, errors = load_dataset(kind)
+        if df.empty:
+            return json_error("; ".join(errors) or "Base nao encontrada.", 404)
+        content = export_dataset_xlsx(df, kind)
+        return send_file(
+            content,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"{Path(filename).stem or kind}.xlsx",
+            max_age=0,
+        )
     try:
         path = resolve_dataset_file(kind, filename)
     except (KeyError, ValueError) as exc:
@@ -343,6 +512,14 @@ def admin_replace_dataset(kind: str):
     suffix = Path(upload.filename).suffix.lower()
     if suffix != ".xlsx":
         return json_error("O replace pelo portal recebe apenas .xlsx e converte automaticamente para SQLite.", 400)
+    try:
+        if require_dataset_persistence():
+            result = persist_dataset_upload(kind, upload, mode="replace")
+            app.logger.info("Base %s substituida no Supabase/Blob por %s", kind, result.get("source"))
+            return result
+    except Exception as exc:
+        return persistence_error(exc)
+
     directory = dataset_directory(kind)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / DATASET_SQLITE_NAMES[kind]
@@ -396,6 +573,26 @@ def admin_append_negotiation_dataset():
         return json_error("A inclusao por transportadora recebe apenas .xlsx.", 400)
 
     kind = "contratos_negociacoes"
+    try:
+        if require_dataset_persistence():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            workspace = tmp_workspace(kind, timestamp)
+            safe_name = blob_storage.safe_blob_name(upload.filename)
+            upload_temp = workspace / safe_name
+            upload.save(upload_temp)
+            new_df = load_xlsx_dataset(upload_temp, kind)
+            validation = validate_contracts(new_df)
+            if not validation.get("ok"):
+                safe_unlink(upload_temp)
+                return json_error("Campos faltantes no arquivo enviado: " + ", ".join(validation.get("missing", [])), 400)
+            current_df, _files, _errors = load_dataset(kind)
+            upload.stream.seek(0)
+            result = persist_dataset_upload(kind, upload, mode="append", current_df=current_df)
+            app.logger.info("Negociacao adicionada no Supabase/Blob: %s", result.get("source"))
+            return result
+    except Exception as exc:
+        return persistence_error(exc)
+
     directory = dataset_directory(kind)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / DATASET_SQLITE_NAMES[kind]
@@ -440,6 +637,32 @@ def admin_delete_negotiation_carrier():
         return json_error("Informe a transportadora para remover.", 400)
 
     kind = "contratos_negociacoes"
+    try:
+        if require_dataset_persistence():
+            df, _files, errors = load_dataset(kind)
+            if df.empty:
+                return json_error("; ".join(errors) or "Base de negociacoes nao encontrada.", 404)
+            name_col = resolve_contract_columns(df).get("nome")
+            if not name_col:
+                return json_error("Coluna de transportadora nao localizada.", 400)
+            wanted = norm_key(carrier)
+            keep_mask = df[name_col].map(lambda value: norm_key(value) != wanted)
+            removed = int((~keep_mask).sum())
+            if removed == 0:
+                return json_error("Transportadora nao encontrada na base de negociacoes.", 404)
+            updated = df.loc[keep_mask].copy()
+            result = persist_dataset_dataframe(
+                kind,
+                updated,
+                mode="delete_carrier",
+                metadata={"carrier": carrier, "removedRows": removed, "totalRows": int(len(updated))},
+            )
+            result.update({"carrier": carrier, "removedRows": removed, "totalRows": int(len(updated))})
+            app.logger.info("Transportadora removida das negociacoes no Supabase: %s (%s linhas)", carrier, removed)
+            return result
+    except Exception as exc:
+        return persistence_error(exc)
+
     directory = dataset_directory(kind)
     target = directory / DATASET_SQLITE_NAMES[kind]
     if not target.exists():
@@ -472,6 +695,16 @@ def admin_delete_dataset_file(kind: str, filename: str):
     blocked = require_admin()
     if blocked:
         return blocked
+    if db.database_configured():
+        try:
+            result = dataset_repository.delete_active_dataset(kind, request.remote_addr)
+            clear_dataset_cache()
+            app.logger.info("Base ativa removida no Supabase: %s", kind)
+            return result
+        except Exception as exc:
+            return persistence_error(exc)
+    if db.is_vercel_runtime():
+        return json_error("DATABASE_URL nao configurado; exclusao persistente indisponivel.", 503)
     try:
         path = resolve_dataset_file(kind, filename)
     except (KeyError, ValueError) as exc:
@@ -493,7 +726,25 @@ def index():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "baseDir": str(BASE_DIR)}
+    database = db.check_database()
+    blob = blob_storage.check_blob()
+    if database["configured"] and blob["configured"]:
+        persistence_mode = "supabase_postgres+vercel_blob"
+    elif db.is_vercel_runtime():
+        persistence_mode = "unconfigured_serverless_read_only"
+    else:
+        persistence_mode = "local_development_files"
+    return {
+        "status": "ok",
+        "baseDir": str(BASE_DIR),
+        "databaseConfigured": database["configured"],
+        "databaseOk": database["ok"],
+        "databaseError": database["error"],
+        "blobConfigured": blob["configured"],
+        "blobOk": blob["ok"],
+        "blobError": blob["error"],
+        "persistenceMode": persistence_mode,
+    }
 
 
 @app.get("/api/files")
@@ -635,6 +886,8 @@ def archive_analysis(analysis_id: str):
         return set_archived(analysis_id, archived)
     except FileNotFoundError as exc:
         return json_error(str(exc), 404)
+    except Exception as exc:
+        return persistence_error(exc)
 
 
 @app.delete("/api/analyses/<analysis_id>")
@@ -643,6 +896,8 @@ def delete_analysis_route(analysis_id: str):
         return delete_analysis(analysis_id)
     except FileNotFoundError as exc:
         return json_error(str(exc), 404)
+    except Exception as exc:
+        return persistence_error(exc)
 
 
 @app.get("/api/analyses/<analysis_id>/export/pdf")
@@ -652,6 +907,8 @@ def export_analysis_pdf(analysis_id: str):
         return json_error("Analise nao encontrada.", 404)
     content = build_analysis_pdf(record)
     filename = f"analise_frete_{analysis_id}.pdf"
+    if request.args.get("save") in {"1", "true", "yes"}:
+        save_export_to_blob(filename, content, "application/pdf", analysis_id)
     return send_file(BytesIO(content), mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)
 
 
@@ -662,6 +919,8 @@ def export_analysis_html(analysis_id: str):
         return json_error("Analise nao encontrada.", 404)
     content = build_final_html([record])
     filename = f"analise_frete_{analysis_id}.html"
+    if request.args.get("save") in {"1", "true", "yes"}:
+        save_export_to_blob(filename, content, "text/html", analysis_id)
     return send_file(BytesIO(content), mimetype="text/html", as_attachment=True, download_name=filename, max_age=0)
 
 
@@ -676,6 +935,8 @@ def export_final_html(ext: str):
             records.append(record)
     content = build_final_html(records)
     filename = f"comparativo_transportadoras.{ext.lower()}"
+    if request.args.get("save") in {"1", "true", "yes"}:
+        save_export_to_blob(filename, content, "text/html")
     return send_file(BytesIO(content), mimetype="text/html", as_attachment=True, download_name=filename, max_age=0)
 
 
@@ -695,6 +956,8 @@ def export_session(ext: str):
         return json_error("Nenhuma analise valida foi informada para exportacao.", 400)
     if ext == "pdf":
         content = build_final_pdf(records)
+        if payload.get("save"):
+            save_export_to_blob("comparativo_transportadoras_consolidado.pdf", content, "application/pdf")
         return send_file(
             BytesIO(content),
             mimetype="application/pdf",
@@ -703,6 +966,8 @@ def export_session(ext: str):
             max_age=0,
         )
     content = build_final_html(records)
+    if payload.get("save"):
+        save_export_to_blob(f"comparativo_transportadoras_consolidado.{ext}", content, "text/html")
     return send_file(
         BytesIO(content),
         mimetype="text/html",
