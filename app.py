@@ -846,6 +846,9 @@ def create_analysis():
         analysis = generate_analysis(payload)
         app.logger.info("Analise criada: %s", analysis.get("id"))
         return analysis, 201
+    except (db.PersistenceNotConfigured, blob_storage.BlobNotConfigured) as exc:
+        app.logger.error("Persistencia nao configurada para gerar analise: %s", exc)
+        return persistence_error(exc)
     except Exception as exc:
         app.logger.exception("Falha ao gerar analise: %s", exc)
         return json_error(str(exc), 400)
