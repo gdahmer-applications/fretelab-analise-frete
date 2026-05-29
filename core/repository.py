@@ -52,7 +52,12 @@ class DatasetFile:
 
 def ensure_directories() -> None:
     for directory in DATASET_DIRS.values():
-        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Serverless providers can expose the source tree as read-only.
+            # Missing dataset directories are handled later as empty datasets.
+            pass
 
 
 def clear_dataset_cache() -> None:
@@ -75,10 +80,10 @@ def _quote_identifier(value: str) -> str:
 def list_dataset_files(kind: str) -> list[DatasetFile]:
     ensure_directories()
     directory = DATASET_DIRS[kind]
-    files = [DatasetFile(kind, path) for path in sorted(directory.iterdir()) if _is_supported(path)]
+    files = [DatasetFile(kind, path) for path in sorted(directory.iterdir()) if _is_supported(path)] if directory.exists() else []
 
     if kind == "contratos_vigentes" and not files:
-        legacy_files = [p for p in sorted(LEGACY_DATA_DIR.glob("*")) if _is_supported(p)]
+        legacy_files = [p for p in sorted(LEGACY_DATA_DIR.glob("*")) if _is_supported(p)] if LEGACY_DATA_DIR.exists() else []
         files.extend(DatasetFile(kind, path, "legacy_data") for path in legacy_files)
 
     return files
@@ -177,17 +182,8 @@ def load_dataset(kind: str) -> tuple[pd.DataFrame, list[dict[str, Any]], list[st
 
     if not frames:
         return pd.DataFrame(), file_infos, errors
-
     return pd.concat(frames, ignore_index=True, sort=False), file_infos, errors
 
 
 def datasets_status() -> dict[str, Any]:
-    status: dict[str, Any] = {}
-    for kind in DATASET_DIRS:
-        files = [item.as_dict() for item in list_dataset_files(kind)]
-        status[kind] = {
-            "directory": str(DATASET_DIRS[kind]),
-            "files": files,
-            "fileCount": len(files),
-        }
-    return status
+    return {kind: [item.as_dict() for item in list_dataset_files(kind)] for kind in DATASET_DIRS}
