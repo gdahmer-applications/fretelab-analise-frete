@@ -56,7 +56,7 @@ A aplicação atual usa arquivos locais para:
 - logs em `logs/*.log`;
 - substituição de bases pelo modo ADM.
 
-Na Vercel, isso deve ser tratado como leitura/temporário. Para produção real, migre histórico, usuários, auditoria e configuração para PostgreSQL. Uploads de bases e arquivos originais devem ir para um storage externo, como Vercel Blob, Supabase Storage, Cloudflare R2 ou S3.
+Na Vercel, isso deve ser tratado como leitura/temporário. Para produção real, este pacote agora inclui a migração para Supabase Postgres e Vercel Blob. Veja `DEPLOY_DATABASE_STORAGE.md`.
 
 
 ## Correção de entrypoint Vercel
