@@ -1275,6 +1275,10 @@
     $("mainCarrier").addEventListener("change", setCarrierOptions);
     $("estbSelect").addEventListener("change", refreshCarriersIfReady);
     $("btnPreviewRefresh").addEventListener("click", () => loadPreview().catch((e) => toast(e.message)));
+    $("authLogoutButton")?.addEventListener("click", async () => {
+      await api("/api/auth/logout", { method: "POST", body: "{}" });
+      window.location.href = "/login";
+    });
     $("previewKind").addEventListener("change", () => loadPreview().catch((e) => toast(e.message)));
     $("previewFilter").addEventListener("input", () => {
       window.clearTimeout(loadPreview.timer);

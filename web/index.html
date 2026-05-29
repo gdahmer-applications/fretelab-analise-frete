@@ -17,7 +17,7 @@
           </button>
           <div>
             <strong>FreteLab</strong>
-            <span>Análises locais</span>
+            <span>Análises persistentes</span>
           </div>
         </div>
         <nav class="top-nav" aria-label="Principal">
@@ -39,6 +39,7 @@
         </nav>
       </div>
       <div class="top-actions">
+        <button class="secondary" id="authLogoutButton" type="button">Sair</button>
         <div class="top-status" id="topStatus">Inicializando...</div>
       </div>
     </header>
@@ -281,7 +282,7 @@
 
       <section class="page" id="page-negociacoes">
         <div class="page-head"><div><p class="eyebrow">Entrada manual</p><h1>Contratos Negociações</h1></div></div>
-        <div class="notice">Inclua arquivos manualmente na pasta <span class="mono">input/contratos_negociacoes</span> e atualize a tela.</div>
+        <div class="notice">Use o modo ADM para registrar bases persistentes no Supabase e armazenar arquivos no Vercel Blob.</div>
         <div id="negociacoesFiles" class="file-page"></div>
       </section>
 

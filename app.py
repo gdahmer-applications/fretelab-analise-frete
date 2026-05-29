@@ -2,21 +2,28 @@ from __future__ import annotations
 
 from datetime import datetime
 import gc
+import hashlib
 from io import BytesIO
 import hmac
+import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import smtplib
+import ssl
 import sqlite3
+import tempfile
+import time
 
-from flask import Flask, abort, request, send_file, send_from_directory, session
+from flask import Flask, abort, redirect, request, send_file, send_from_directory, session
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 import pandas as pd
 
 from core.analysis_engine import available_carriers, available_carriers_by_location, generate_analysis, location_options, resolve_location_from_cep
+from core import blob_storage, dataset_repository, db
 from core.exporter import build_analysis_pdf, build_final_html, build_final_pdf
 from core.history import delete_analysis, list_analyses, load_analysis, set_archived
 from core.importer import load_xlsx_dataset
@@ -29,7 +36,8 @@ from core.validation import resolve_contract_columns, validate_contracts, valida
 from utils.export_files import build_pdf_bytes, build_xlsx_bytes
 
 ensure_directories()
-LOGS_DIR.mkdir(parents=True, exist_ok=True)
+if os.getenv("VERCEL") != "1":
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_local_env() -> None:
@@ -54,6 +62,7 @@ app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "30")) * 1024 
 app.secret_key = os.getenv("FRETELAB_SECRET_KEY") or secrets.token_hex(32)
 
 ADMIN_PASSWORD = os.getenv("FRETELAB_ADMIN_PASSWORD", "")
+AUTH_CODE_TTL_SECONDS = int(os.getenv("FRETELAB_AUTH_CODE_TTL_SECONDS", "600"))
 DATASET_SQLITE_NAMES = {
     "contratos_vigentes": "dados.sqlite",
     "contratos_negociacoes": "negociacoes.sqlite",
@@ -63,15 +72,275 @@ DATASET_SQLITE_NAMES = {
 }
 CONTRACT_TEMPLATE_PATH = BASE_DIR / "input" / "templates" / "template_contratos_fretelab.xlsx"
 
-logging.basicConfig(
-    filename=str(LOGS_DIR / "frete_app.log"),
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(message)s",
-)
+if os.getenv("VERCEL") == "1":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+else:
+    logging.basicConfig(
+        filename=str(LOGS_DIR / "frete_app.log"),
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
 
 
 def json_error(message: str, status: int = 400):
     return {"error": message}, status
+
+
+def persistence_error(exc: Exception):
+    if isinstance(exc, (db.PersistenceNotConfigured, blob_storage.BlobNotConfigured)):
+        return json_error(str(exc), 503)
+    return json_error(str(exc), 400)
+
+
+def auth_enabled() -> bool:
+    return os.getenv("FRETELAB_AUTH_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def auth_users() -> dict[str, str]:
+    raw = os.getenv("FRETELAB_AUTH_USERS", "").strip()
+    users: dict[str, str] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                users.update({str(email).strip().lower(): str(password) for email, password in parsed.items()})
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and item.get("email") and item.get("password"):
+                        users[str(item["email"]).strip().lower()] = str(item["password"])
+        except json.JSONDecodeError:
+            app.logger.error("FRETELAB_AUTH_USERS invalido; use JSON.")
+
+    email = os.getenv("FRETELAB_LOGIN_EMAIL", "").strip().lower()
+    password = os.getenv("FRETELAB_LOGIN_PASSWORD", "")
+    if email and password:
+        users[email] = password
+    return users
+
+
+def auth_configured() -> bool:
+    return bool(auth_users())
+
+
+def user_is_authenticated() -> bool:
+    return bool(session.get("auth_email"))
+
+
+def _code_digest(email: str, code: str) -> str:
+    return hashlib.sha256(f"{app.secret_key}:{email.lower()}:{code}".encode("utf-8")).hexdigest()
+
+
+def send_login_code(email: str, code: str) -> None:
+    host = os.getenv("SMTP_HOST", "").strip()
+    port = int(os.getenv("SMTP_PORT", "587"))
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "")
+    sender = os.getenv("SMTP_FROM", username or email).strip()
+    use_tls = os.getenv("SMTP_USE_TLS", "1").strip().lower() not in {"0", "false", "no"}
+    if not host:
+        if not db.is_vercel_runtime() and os.getenv("FRETELAB_AUTH_DEV_CODES", "1").strip().lower() in {"1", "true", "yes"}:
+            app.logger.warning("Codigo de login FreteLab para %s: %s", email, code)
+            return
+        raise RuntimeError("SMTP_HOST nao configurado para envio do codigo de login.")
+
+    subject = "Codigo de acesso FreteLab"
+    body = (
+        f"Seu codigo de acesso ao FreteLab e: {code}\n\n"
+        f"Ele expira em {AUTH_CODE_TTL_SECONDS // 60} minutos. "
+        "Se voce nao solicitou este acesso, ignore este email."
+    )
+    message = "\r\n".join([
+        f"From: {sender}",
+        f"To: {email}",
+        f"Subject: {subject}",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        body,
+    ])
+
+    if use_tls:
+        with smtplib.SMTP(host, port, timeout=15) as smtp:
+            smtp.starttls(context=ssl.create_default_context())
+            if username:
+                smtp.login(username, password)
+            smtp.sendmail(sender, [email], message.encode("utf-8"))
+    else:
+        with smtplib.SMTP_SSL(host, port, timeout=15) as smtp:
+            if username:
+                smtp.login(username, password)
+            smtp.sendmail(sender, [email], message.encode("utf-8"))
+
+
+def login_page() -> str:
+    return """<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FreteLab - Login</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #101319; color: #eef1f5; font-family: "Segoe UI", Arial, sans-serif; }
+    main { width: min(420px, calc(100vw - 32px)); border: 1px solid #2b313d; border-radius: 8px; background: #141821; padding: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    p { margin: 0 0 18px; color: #9aa3b2; line-height: 1.45; }
+    label { display: block; margin: 12px 0; font-size: 13px; color: #cfd5df; }
+    input { width: 100%; margin-top: 6px; border: 1px solid #303847; border-radius: 6px; padding: 12px; background: #0e1117; color: #eef1f5; font-size: 15px; }
+    button { width: 100%; margin-top: 14px; border: 0; border-radius: 6px; padding: 12px 14px; background: #57c7b6; color: #08100f; font-weight: 800; cursor: pointer; }
+    button:disabled { opacity: .65; cursor: wait; }
+    .status { min-height: 22px; margin-top: 14px; color: #f2c66d; font-size: 13px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>FreteLab</h1>
+    <p>Entre com email e senha. Em seguida enviaremos um codigo de 6 digitos para confirmar o acesso.</p>
+    <form id="passwordStep">
+      <label>Email<input id="email" type="email" autocomplete="email" required /></label>
+      <label>Senha<input id="password" type="password" autocomplete="current-password" required /></label>
+      <button type="submit">Enviar codigo</button>
+    </form>
+    <form id="codeStep" class="hidden">
+      <label>Codigo de 6 digitos<input id="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" required /></label>
+      <button type="submit">Entrar</button>
+    </form>
+    <div class="status" id="status"></div>
+  </main>
+  <script>
+    const statusEl = document.getElementById("status");
+    const passwordStep = document.getElementById("passwordStep");
+    const codeStep = document.getElementById("codeStep");
+    async function post(url, body) {
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Falha na autenticacao.");
+      return data;
+    }
+    passwordStep.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.submitter;
+      button.disabled = true;
+      statusEl.textContent = "Enviando codigo...";
+      try {
+        await post("/api/auth/login", { email: email.value, password: password.value });
+        passwordStep.classList.add("hidden");
+        codeStep.classList.remove("hidden");
+        code.focus();
+        statusEl.textContent = "Codigo enviado para seu email.";
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+    codeStep.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.submitter;
+      button.disabled = true;
+      statusEl.textContent = "Validando codigo...";
+      try {
+        await post("/api/auth/verify", { code: code.value });
+        window.location.href = "/";
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>"""
+
+
+@app.before_request
+def require_login():
+    if not auth_enabled():
+        return None
+    public_exact = {"/login", "/health", "/api/auth/status", "/api/auth/login", "/api/auth/verify", "/api/auth/logout"}
+    if request.path in public_exact:
+        return None
+    if user_is_authenticated():
+        return None
+    if request.path.startswith("/api/"):
+        return json_error("Autenticacao necessaria.", 401)
+    return redirect("/login")
+
+
+@app.get("/login")
+def login():
+    if user_is_authenticated():
+        return redirect("/")
+    return login_page()
+
+
+@app.get("/api/auth/status")
+def auth_status():
+    return {
+        "enabled": auth_enabled(),
+        "configured": auth_configured(),
+        "authenticated": user_is_authenticated(),
+        "email": session.get("auth_email") or "",
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login():
+    if not auth_enabled():
+        session["auth_email"] = "disabled"
+        return {"ok": True, "requiresCode": False}
+    users = auth_users()
+    if not users:
+        return json_error("Login nao configurado. Defina FRETELAB_LOGIN_EMAIL e FRETELAB_LOGIN_PASSWORD.", 503)
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email") or "").strip().lower()
+    password = str(payload.get("password") or "")
+    expected = users.get(email)
+    if not expected or not hmac.compare_digest(password, expected):
+        return json_error("Email ou senha invalidos.", 401)
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        send_login_code(email, code)
+    except Exception as exc:
+        app.logger.error("Falha ao enviar codigo de login para %s: %s", email, exc)
+        return json_error(str(exc), 503)
+    session["auth_pending_email"] = email
+    session["auth_code_hash"] = _code_digest(email, code)
+    session["auth_code_expires"] = int(time.time()) + AUTH_CODE_TTL_SECONDS
+    session["auth_code_attempts"] = 0
+    session.pop("auth_email", None)
+    return {"ok": True, "requiresCode": True}
+
+
+@app.post("/api/auth/verify")
+def auth_verify():
+    payload = request.get_json(silent=True) or {}
+    code = "".join(ch for ch in str(payload.get("code") or "") if ch.isdigit())
+    email = str(session.get("auth_pending_email") or "")
+    expires = int(session.get("auth_code_expires") or 0)
+    attempts = int(session.get("auth_code_attempts") or 0)
+    if not email or not session.get("auth_code_hash"):
+        return json_error("Solicite um novo codigo.", 400)
+    if time.time() > expires:
+        return json_error("Codigo expirado. Solicite um novo codigo.", 400)
+    if attempts >= 5:
+        return json_error("Muitas tentativas. Solicite um novo codigo.", 429)
+    session["auth_code_attempts"] = attempts + 1
+    if len(code) != 6 or not hmac.compare_digest(_code_digest(email, code), str(session.get("auth_code_hash"))):
+        return json_error("Codigo invalido.", 401)
+    session["auth_email"] = email
+    session.pop("auth_pending_email", None)
+    session.pop("auth_code_hash", None)
+    session.pop("auth_code_expires", None)
+    session.pop("auth_code_attempts", None)
+    return {"ok": True, "email": email}
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    session.clear()
+    return {"ok": True}
 
 
 def is_admin() -> bool:
@@ -82,6 +351,22 @@ def require_admin():
     if not is_admin():
         return json_error("Modo ADM necessario para esta operacao.", 403)
     return None
+
+
+def require_dataset_persistence() -> bool:
+    if db.database_configured():
+        if not blob_storage.blob_configured():
+            raise blob_storage.BlobNotConfigured("BLOB_READ_WRITE_TOKEN nao configurado para persistir arquivos.")
+        return True
+    if db.is_vercel_runtime():
+        raise db.PersistenceNotConfigured("DATABASE_URL nao configurado; manutencao ADM persistente indisponivel.")
+    return False
+
+
+def tmp_workspace(kind: str, timestamp: str) -> Path:
+    root = Path(tempfile.gettempdir()) / "fretelab" / kind / timestamp
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 
 
 def dataset_directory(kind: str) -> Path:
@@ -144,6 +429,135 @@ def convert_xlsx_to_sqlite(source: Path, target: Path, kind: str) -> None:
     safe_unlink(target)
     df = load_xlsx_dataset(source, kind)
     write_dataset_sqlite(df, target, kind, source.name)
+
+
+def upload_and_register_file(
+    path: Path,
+    *,
+    purpose: str,
+    dataset_kind: str | None,
+    original_filename: str,
+    content_type: str,
+    blob_folder: str,
+) -> str:
+    pathname = blob_storage.blob_path(blob_folder, blob_storage.safe_blob_name(path.name))
+    blob_info = blob_storage.upload_path(path, pathname, content_type=content_type).as_dict()
+    return dataset_repository.register_uploaded_file(
+        purpose=purpose,
+        dataset_kind=dataset_kind,
+        original_filename=original_filename,
+        content_type=content_type,
+        size_bytes=path.stat().st_size,
+        blob_info=blob_info,
+    )
+
+
+def persist_dataset_upload(kind: str, upload, *, mode: str, current_df: pd.DataFrame | None = None) -> dict[str, object]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    workspace = tmp_workspace(kind, timestamp)
+    safe_name = blob_storage.safe_blob_name(upload.filename or f"{kind}.xlsx")
+    upload_temp = workspace / safe_name
+    sqlite_temp = workspace / DATASET_SQLITE_NAMES[kind]
+    upload.save(upload_temp)
+
+    new_df = load_xlsx_dataset(upload_temp, kind)
+    if current_df is not None and not current_df.empty:
+        final_df = pd.concat([current_df, new_df], ignore_index=True, sort=False)
+    else:
+        final_df = new_df
+
+    write_dataset_sqlite(final_df, sqlite_temp, kind, safe_name)
+    validate_sqlite_file(sqlite_temp)
+
+    source_file_id = upload_and_register_file(
+        upload_temp,
+        purpose="dataset_original",
+        dataset_kind=kind,
+        original_filename=safe_name,
+        content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        blob_folder=blob_storage.blob_path("datasets", "original", kind),
+    )
+    sqlite_file_id = upload_and_register_file(
+        sqlite_temp,
+        purpose="dataset_sqlite_backup",
+        dataset_kind=kind,
+        original_filename=sqlite_temp.name,
+        content_type="application/vnd.sqlite3",
+        blob_folder=blob_storage.blob_path("datasets", "sqlite", kind),
+    )
+    version_id = dataset_repository.create_dataset_version(
+        kind=kind,
+        df=final_df,
+        source_file_id=source_file_id,
+        sqlite_file_id=sqlite_file_id,
+        version_label=f"{kind}_{timestamp}",
+        metadata={"mode": mode, "source_file": safe_name, "rows_added": int(len(new_df))},
+    )
+    dataset_repository.audit(
+        f"dataset.{mode}",
+        "dataset_version",
+        version_id,
+        {"kind": kind, "sourceFileId": source_file_id, "sqliteFileId": sqlite_file_id, "rows": int(len(final_df))},
+        request.remote_addr,
+    )
+    clear_dataset_cache()
+    return {
+        "ok": True,
+        "kind": kind,
+        "file": DATASET_SQLITE_NAMES[kind],
+        "source": safe_name,
+        "versionId": version_id,
+        "addedRows": int(len(new_df)),
+        "totalRows": int(len(final_df)),
+    }
+
+
+def persist_dataset_dataframe(kind: str, df: pd.DataFrame, *, mode: str, metadata: dict[str, object]) -> dict[str, object]:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    workspace = tmp_workspace(kind, timestamp)
+    sqlite_temp = workspace / DATASET_SQLITE_NAMES[kind]
+    write_dataset_sqlite(df, sqlite_temp, kind, mode)
+    validate_sqlite_file(sqlite_temp)
+    sqlite_file_id = upload_and_register_file(
+        sqlite_temp,
+        purpose="dataset_sqlite_backup",
+        dataset_kind=kind,
+        original_filename=sqlite_temp.name,
+        content_type="application/vnd.sqlite3",
+        blob_folder=blob_storage.blob_path("datasets", "sqlite", kind),
+    )
+    version_id = dataset_repository.create_dataset_version(
+        kind=kind,
+        df=df,
+        source_file_id=None,
+        sqlite_file_id=sqlite_file_id,
+        version_label=f"{kind}_{timestamp}",
+        metadata={"mode": mode, **metadata},
+    )
+    dataset_repository.audit(
+        f"dataset.{mode}",
+        "dataset_version",
+        version_id,
+        {"kind": kind, "sqliteFileId": sqlite_file_id, **metadata},
+        request.remote_addr,
+    )
+    clear_dataset_cache()
+    return {"ok": True, "kind": kind, "file": DATASET_SQLITE_NAMES[kind], "versionId": version_id}
+
+
+def save_export_to_blob(name: str, content: bytes, content_type: str, analysis_id: str | None = None) -> None:
+    if not (db.database_configured() and blob_storage.blob_configured()):
+        return
+    pathname = blob_storage.blob_path("exports", analysis_id or "session", blob_storage.safe_blob_name(name))
+    blob_info = blob_storage.upload_bytes(pathname, content, content_type=content_type).as_dict()
+    dataset_repository.register_uploaded_file(
+        purpose="analysis_export",
+        dataset_kind=None,
+        original_filename=name,
+        content_type=content_type,
+        size_bytes=len(content),
+        blob_info=blob_info,
+    )
 
 
 def safe_unlink(path: Path) -> None:
@@ -298,6 +712,18 @@ def admin_download_dataset(kind: str, filename: str):
     blocked = require_admin()
     if blocked:
         return blocked
+    if db.database_configured():
+        df, files, errors = load_dataset(kind)
+        if df.empty:
+            return json_error("; ".join(errors) or "Base nao encontrada.", 404)
+        content = export_dataset_xlsx(df, kind)
+        return send_file(
+            content,
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            as_attachment=True,
+            download_name=f"{Path(filename).stem or kind}.xlsx",
+            max_age=0,
+        )
     try:
         path = resolve_dataset_file(kind, filename)
     except (KeyError, ValueError) as exc:
@@ -343,6 +769,14 @@ def admin_replace_dataset(kind: str):
     suffix = Path(upload.filename).suffix.lower()
     if suffix != ".xlsx":
         return json_error("O replace pelo portal recebe apenas .xlsx e converte automaticamente para SQLite.", 400)
+    try:
+        if require_dataset_persistence():
+            result = persist_dataset_upload(kind, upload, mode="replace")
+            app.logger.info("Base %s substituida no Supabase/Blob por %s", kind, result.get("source"))
+            return result
+    except Exception as exc:
+        return persistence_error(exc)
+
     directory = dataset_directory(kind)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / DATASET_SQLITE_NAMES[kind]
@@ -396,6 +830,26 @@ def admin_append_negotiation_dataset():
         return json_error("A inclusao por transportadora recebe apenas .xlsx.", 400)
 
     kind = "contratos_negociacoes"
+    try:
+        if require_dataset_persistence():
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            workspace = tmp_workspace(kind, timestamp)
+            safe_name = blob_storage.safe_blob_name(upload.filename)
+            upload_temp = workspace / safe_name
+            upload.save(upload_temp)
+            new_df = load_xlsx_dataset(upload_temp, kind)
+            validation = validate_contracts(new_df)
+            if not validation.get("ok"):
+                safe_unlink(upload_temp)
+                return json_error("Campos faltantes no arquivo enviado: " + ", ".join(validation.get("missing", [])), 400)
+            current_df, _files, _errors = load_dataset(kind)
+            upload.stream.seek(0)
+            result = persist_dataset_upload(kind, upload, mode="append", current_df=current_df)
+            app.logger.info("Negociacao adicionada no Supabase/Blob: %s", result.get("source"))
+            return result
+    except Exception as exc:
+        return persistence_error(exc)
+
     directory = dataset_directory(kind)
     directory.mkdir(parents=True, exist_ok=True)
     target = directory / DATASET_SQLITE_NAMES[kind]
@@ -440,6 +894,32 @@ def admin_delete_negotiation_carrier():
         return json_error("Informe a transportadora para remover.", 400)
 
     kind = "contratos_negociacoes"
+    try:
+        if require_dataset_persistence():
+            df, _files, errors = load_dataset(kind)
+            if df.empty:
+                return json_error("; ".join(errors) or "Base de negociacoes nao encontrada.", 404)
+            name_col = resolve_contract_columns(df).get("nome")
+            if not name_col:
+                return json_error("Coluna de transportadora nao localizada.", 400)
+            wanted = norm_key(carrier)
+            keep_mask = df[name_col].map(lambda value: norm_key(value) != wanted)
+            removed = int((~keep_mask).sum())
+            if removed == 0:
+                return json_error("Transportadora nao encontrada na base de negociacoes.", 404)
+            updated = df.loc[keep_mask].copy()
+            result = persist_dataset_dataframe(
+                kind,
+                updated,
+                mode="delete_carrier",
+                metadata={"carrier": carrier, "removedRows": removed, "totalRows": int(len(updated))},
+            )
+            result.update({"carrier": carrier, "removedRows": removed, "totalRows": int(len(updated))})
+            app.logger.info("Transportadora removida das negociacoes no Supabase: %s (%s linhas)", carrier, removed)
+            return result
+    except Exception as exc:
+        return persistence_error(exc)
+
     directory = dataset_directory(kind)
     target = directory / DATASET_SQLITE_NAMES[kind]
     if not target.exists():
@@ -472,6 +952,16 @@ def admin_delete_dataset_file(kind: str, filename: str):
     blocked = require_admin()
     if blocked:
         return blocked
+    if db.database_configured():
+        try:
+            result = dataset_repository.delete_active_dataset(kind, request.remote_addr)
+            clear_dataset_cache()
+            app.logger.info("Base ativa removida no Supabase: %s", kind)
+            return result
+        except Exception as exc:
+            return persistence_error(exc)
+    if db.is_vercel_runtime():
+        return json_error("DATABASE_URL nao configurado; exclusao persistente indisponivel.", 503)
     try:
         path = resolve_dataset_file(kind, filename)
     except (KeyError, ValueError) as exc:
@@ -493,7 +983,27 @@ def index():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "baseDir": str(BASE_DIR)}
+    database = db.check_database()
+    blob = blob_storage.check_blob()
+    if database["configured"] and blob["configured"]:
+        persistence_mode = "supabase_postgres+vercel_blob"
+    elif db.is_vercel_runtime():
+        persistence_mode = "unconfigured_serverless_read_only"
+    else:
+        persistence_mode = "local_development_files"
+    return {
+        "status": "ok",
+        "baseDir": str(BASE_DIR),
+        "databaseConfigured": database["configured"],
+        "databaseOk": database["ok"],
+        "databaseError": database["error"],
+        "blobConfigured": blob["configured"],
+        "blobOk": blob["ok"],
+        "blobError": blob["error"],
+        "persistenceMode": persistence_mode,
+        "authEnabled": auth_enabled(),
+        "authConfigured": auth_configured(),
+    }
 
 
 @app.get("/api/files")
@@ -595,6 +1105,9 @@ def create_analysis():
         analysis = generate_analysis(payload)
         app.logger.info("Analise criada: %s", analysis.get("id"))
         return analysis, 201
+    except (db.PersistenceNotConfigured, blob_storage.BlobNotConfigured) as exc:
+        app.logger.error("Persistencia nao configurada para gerar analise: %s", exc)
+        return persistence_error(exc)
     except Exception as exc:
         app.logger.exception("Falha ao gerar analise: %s", exc)
         return json_error(str(exc), 400)
@@ -635,6 +1148,8 @@ def archive_analysis(analysis_id: str):
         return set_archived(analysis_id, archived)
     except FileNotFoundError as exc:
         return json_error(str(exc), 404)
+    except Exception as exc:
+        return persistence_error(exc)
 
 
 @app.delete("/api/analyses/<analysis_id>")
@@ -643,6 +1158,8 @@ def delete_analysis_route(analysis_id: str):
         return delete_analysis(analysis_id)
     except FileNotFoundError as exc:
         return json_error(str(exc), 404)
+    except Exception as exc:
+        return persistence_error(exc)
 
 
 @app.get("/api/analyses/<analysis_id>/export/pdf")
@@ -652,6 +1169,8 @@ def export_analysis_pdf(analysis_id: str):
         return json_error("Analise nao encontrada.", 404)
     content = build_analysis_pdf(record)
     filename = f"analise_frete_{analysis_id}.pdf"
+    if request.args.get("save") in {"1", "true", "yes"}:
+        save_export_to_blob(filename, content, "application/pdf", analysis_id)
     return send_file(BytesIO(content), mimetype="application/pdf", as_attachment=True, download_name=filename, max_age=0)
 
 
@@ -662,6 +1181,8 @@ def export_analysis_html(analysis_id: str):
         return json_error("Analise nao encontrada.", 404)
     content = build_final_html([record])
     filename = f"analise_frete_{analysis_id}.html"
+    if request.args.get("save") in {"1", "true", "yes"}:
+        save_export_to_blob(filename, content, "text/html", analysis_id)
     return send_file(BytesIO(content), mimetype="text/html", as_attachment=True, download_name=filename, max_age=0)
 
 
@@ -676,6 +1197,8 @@ def export_final_html(ext: str):
             records.append(record)
     content = build_final_html(records)
     filename = f"comparativo_transportadoras.{ext.lower()}"
+    if request.args.get("save") in {"1", "true", "yes"}:
+        save_export_to_blob(filename, content, "text/html")
     return send_file(BytesIO(content), mimetype="text/html", as_attachment=True, download_name=filename, max_age=0)
 
 
@@ -695,6 +1218,8 @@ def export_session(ext: str):
         return json_error("Nenhuma analise valida foi informada para exportacao.", 400)
     if ext == "pdf":
         content = build_final_pdf(records)
+        if payload.get("save"):
+            save_export_to_blob("comparativo_transportadoras_consolidado.pdf", content, "application/pdf")
         return send_file(
             BytesIO(content),
             mimetype="application/pdf",
@@ -703,6 +1228,8 @@ def export_session(ext: str):
             max_age=0,
         )
     content = build_final_html(records)
+    if payload.get("save"):
+        save_export_to_blob(f"comparativo_transportadoras_consolidado.{ext}", content, "text/html")
     return send_file(
         BytesIO(content),
         mimetype="text/html",

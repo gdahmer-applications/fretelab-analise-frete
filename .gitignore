@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.env
+.venv/
+logs/*.log
+storage/cep_cache.json
+storage/analises/*.json
+storage/exports/

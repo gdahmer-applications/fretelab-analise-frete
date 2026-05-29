@@ -9,6 +9,7 @@ from typing import Any
 import pandas as pd
 from openpyxl import load_workbook
 
+from . import dataset_repository, db
 from .normalization import clean_dataframe
 from .settings import (
     CEP_IBGE_DIR,
@@ -162,6 +163,13 @@ def load_file(path: Path, sheet: str | None = None) -> pd.DataFrame:
 
 
 def load_dataset(kind: str) -> tuple[pd.DataFrame, list[dict[str, Any]], list[str]]:
+    if db.database_configured():
+        df, file_infos, errors = dataset_repository.active_dataset(kind)
+        if not df.empty or file_infos:
+            return df, file_infos, errors
+        if db.is_vercel_runtime():
+            return df, file_infos, [f"Nenhuma versao ativa da base {kind} encontrada no Supabase."]
+
     frames: list[pd.DataFrame] = []
     file_infos: list[dict[str, Any]] = []
     errors: list[str] = []
@@ -186,4 +194,22 @@ def load_dataset(kind: str) -> tuple[pd.DataFrame, list[dict[str, Any]], list[st
 
 
 def datasets_status() -> dict[str, Any]:
-    return {kind: [item.as_dict() for item in list_dataset_files(kind)] for kind in DATASET_DIRS}
+    if db.database_configured():
+        db_status = dataset_repository.datasets_status(list(DATASET_DIRS.keys()))
+        return {
+            kind: {
+                "directory": "supabase:dataset_versions",
+                "source": "supabase",
+                "files": db_status.get(kind, []),
+            }
+            for kind in DATASET_DIRS
+        }
+
+    return {
+        kind: {
+            "directory": str(DATASET_DIRS[kind]),
+            "source": "local",
+            "files": [item.as_dict() for item in list_dataset_files(kind)],
+        }
+        for kind in DATASET_DIRS
+    }
