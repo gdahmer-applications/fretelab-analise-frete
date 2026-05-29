@@ -2,16 +2,21 @@ from __future__ import annotations
 
 from datetime import datetime
 import gc
+import hashlib
 from io import BytesIO
 import hmac
+import json
 import logging
 import os
 from pathlib import Path
 import secrets
+import smtplib
+import ssl
 import sqlite3
 import tempfile
+import time
 
-from flask import Flask, abort, request, send_file, send_from_directory, session
+from flask import Flask, abort, redirect, request, send_file, send_from_directory, session
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
@@ -57,6 +62,7 @@ app.config["MAX_CONTENT_LENGTH"] = int(os.getenv("MAX_UPLOAD_MB", "30")) * 1024 
 app.secret_key = os.getenv("FRETELAB_SECRET_KEY") or secrets.token_hex(32)
 
 ADMIN_PASSWORD = os.getenv("FRETELAB_ADMIN_PASSWORD", "")
+AUTH_CODE_TTL_SECONDS = int(os.getenv("FRETELAB_AUTH_CODE_TTL_SECONDS", "600"))
 DATASET_SQLITE_NAMES = {
     "contratos_vigentes": "dados.sqlite",
     "contratos_negociacoes": "negociacoes.sqlite",
@@ -84,6 +90,257 @@ def persistence_error(exc: Exception):
     if isinstance(exc, (db.PersistenceNotConfigured, blob_storage.BlobNotConfigured)):
         return json_error(str(exc), 503)
     return json_error(str(exc), 400)
+
+
+def auth_enabled() -> bool:
+    return os.getenv("FRETELAB_AUTH_ENABLED", "1").strip().lower() not in {"0", "false", "no"}
+
+
+def auth_users() -> dict[str, str]:
+    raw = os.getenv("FRETELAB_AUTH_USERS", "").strip()
+    users: dict[str, str] = {}
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                users.update({str(email).strip().lower(): str(password) for email, password in parsed.items()})
+            elif isinstance(parsed, list):
+                for item in parsed:
+                    if isinstance(item, dict) and item.get("email") and item.get("password"):
+                        users[str(item["email"]).strip().lower()] = str(item["password"])
+        except json.JSONDecodeError:
+            app.logger.error("FRETELAB_AUTH_USERS invalido; use JSON.")
+
+    email = os.getenv("FRETELAB_LOGIN_EMAIL", "").strip().lower()
+    password = os.getenv("FRETELAB_LOGIN_PASSWORD", "")
+    if email and password:
+        users[email] = password
+    return users
+
+
+def auth_configured() -> bool:
+    return bool(auth_users())
+
+
+def user_is_authenticated() -> bool:
+    return bool(session.get("auth_email"))
+
+
+def _code_digest(email: str, code: str) -> str:
+    return hashlib.sha256(f"{app.secret_key}:{email.lower()}:{code}".encode("utf-8")).hexdigest()
+
+
+def send_login_code(email: str, code: str) -> None:
+    host = os.getenv("SMTP_HOST", "").strip()
+    port = int(os.getenv("SMTP_PORT", "587"))
+    username = os.getenv("SMTP_USERNAME", "").strip()
+    password = os.getenv("SMTP_PASSWORD", "")
+    sender = os.getenv("SMTP_FROM", username or email).strip()
+    use_tls = os.getenv("SMTP_USE_TLS", "1").strip().lower() not in {"0", "false", "no"}
+    if not host:
+        if not db.is_vercel_runtime() and os.getenv("FRETELAB_AUTH_DEV_CODES", "1").strip().lower() in {"1", "true", "yes"}:
+            app.logger.warning("Codigo de login FreteLab para %s: %s", email, code)
+            return
+        raise RuntimeError("SMTP_HOST nao configurado para envio do codigo de login.")
+
+    subject = "Codigo de acesso FreteLab"
+    body = (
+        f"Seu codigo de acesso ao FreteLab e: {code}\n\n"
+        f"Ele expira em {AUTH_CODE_TTL_SECONDS // 60} minutos. "
+        "Se voce nao solicitou este acesso, ignore este email."
+    )
+    message = "\r\n".join([
+        f"From: {sender}",
+        f"To: {email}",
+        f"Subject: {subject}",
+        "Content-Type: text/plain; charset=utf-8",
+        "",
+        body,
+    ])
+
+    if use_tls:
+        with smtplib.SMTP(host, port, timeout=15) as smtp:
+            smtp.starttls(context=ssl.create_default_context())
+            if username:
+                smtp.login(username, password)
+            smtp.sendmail(sender, [email], message.encode("utf-8"))
+    else:
+        with smtplib.SMTP_SSL(host, port, timeout=15) as smtp:
+            if username:
+                smtp.login(username, password)
+            smtp.sendmail(sender, [email], message.encode("utf-8"))
+
+
+def login_page() -> str:
+    return """<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FreteLab - Login</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; background: #101319; color: #eef1f5; font-family: "Segoe UI", Arial, sans-serif; }
+    main { width: min(420px, calc(100vw - 32px)); border: 1px solid #2b313d; border-radius: 8px; background: #141821; padding: 24px; box-shadow: 0 24px 80px rgba(0,0,0,.35); }
+    h1 { margin: 0 0 6px; font-size: 24px; }
+    p { margin: 0 0 18px; color: #9aa3b2; line-height: 1.45; }
+    label { display: block; margin: 12px 0; font-size: 13px; color: #cfd5df; }
+    input { width: 100%; margin-top: 6px; border: 1px solid #303847; border-radius: 6px; padding: 12px; background: #0e1117; color: #eef1f5; font-size: 15px; }
+    button { width: 100%; margin-top: 14px; border: 0; border-radius: 6px; padding: 12px 14px; background: #57c7b6; color: #08100f; font-weight: 800; cursor: pointer; }
+    button:disabled { opacity: .65; cursor: wait; }
+    .status { min-height: 22px; margin-top: 14px; color: #f2c66d; font-size: 13px; }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>FreteLab</h1>
+    <p>Entre com email e senha. Em seguida enviaremos um codigo de 6 digitos para confirmar o acesso.</p>
+    <form id="passwordStep">
+      <label>Email<input id="email" type="email" autocomplete="email" required /></label>
+      <label>Senha<input id="password" type="password" autocomplete="current-password" required /></label>
+      <button type="submit">Enviar codigo</button>
+    </form>
+    <form id="codeStep" class="hidden">
+      <label>Codigo de 6 digitos<input id="code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" required /></label>
+      <button type="submit">Entrar</button>
+    </form>
+    <div class="status" id="status"></div>
+  </main>
+  <script>
+    const statusEl = document.getElementById("status");
+    const passwordStep = document.getElementById("passwordStep");
+    const codeStep = document.getElementById("codeStep");
+    async function post(url, body) {
+      const response = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || "Falha na autenticacao.");
+      return data;
+    }
+    passwordStep.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.submitter;
+      button.disabled = true;
+      statusEl.textContent = "Enviando codigo...";
+      try {
+        await post("/api/auth/login", { email: email.value, password: password.value });
+        passwordStep.classList.add("hidden");
+        codeStep.classList.remove("hidden");
+        code.focus();
+        statusEl.textContent = "Codigo enviado para seu email.";
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+    codeStep.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      const button = event.submitter;
+      button.disabled = true;
+      statusEl.textContent = "Validando codigo...";
+      try {
+        await post("/api/auth/verify", { code: code.value });
+        window.location.href = "/";
+      } catch (error) {
+        statusEl.textContent = error.message;
+      } finally {
+        button.disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>"""
+
+
+@app.before_request
+def require_login():
+    if not auth_enabled():
+        return None
+    public_exact = {"/login", "/health", "/api/auth/status", "/api/auth/login", "/api/auth/verify", "/api/auth/logout"}
+    if request.path in public_exact:
+        return None
+    if user_is_authenticated():
+        return None
+    if request.path.startswith("/api/"):
+        return json_error("Autenticacao necessaria.", 401)
+    return redirect("/login")
+
+
+@app.get("/login")
+def login():
+    if user_is_authenticated():
+        return redirect("/")
+    return login_page()
+
+
+@app.get("/api/auth/status")
+def auth_status():
+    return {
+        "enabled": auth_enabled(),
+        "configured": auth_configured(),
+        "authenticated": user_is_authenticated(),
+        "email": session.get("auth_email") or "",
+    }
+
+
+@app.post("/api/auth/login")
+def auth_login():
+    if not auth_enabled():
+        session["auth_email"] = "disabled"
+        return {"ok": True, "requiresCode": False}
+    users = auth_users()
+    if not users:
+        return json_error("Login nao configurado. Defina FRETELAB_LOGIN_EMAIL e FRETELAB_LOGIN_PASSWORD.", 503)
+    payload = request.get_json(silent=True) or {}
+    email = str(payload.get("email") or "").strip().lower()
+    password = str(payload.get("password") or "")
+    expected = users.get(email)
+    if not expected or not hmac.compare_digest(password, expected):
+        return json_error("Email ou senha invalidos.", 401)
+
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    try:
+        send_login_code(email, code)
+    except Exception as exc:
+        app.logger.error("Falha ao enviar codigo de login para %s: %s", email, exc)
+        return json_error(str(exc), 503)
+    session["auth_pending_email"] = email
+    session["auth_code_hash"] = _code_digest(email, code)
+    session["auth_code_expires"] = int(time.time()) + AUTH_CODE_TTL_SECONDS
+    session["auth_code_attempts"] = 0
+    session.pop("auth_email", None)
+    return {"ok": True, "requiresCode": True}
+
+
+@app.post("/api/auth/verify")
+def auth_verify():
+    payload = request.get_json(silent=True) or {}
+    code = "".join(ch for ch in str(payload.get("code") or "") if ch.isdigit())
+    email = str(session.get("auth_pending_email") or "")
+    expires = int(session.get("auth_code_expires") or 0)
+    attempts = int(session.get("auth_code_attempts") or 0)
+    if not email or not session.get("auth_code_hash"):
+        return json_error("Solicite um novo codigo.", 400)
+    if time.time() > expires:
+        return json_error("Codigo expirado. Solicite um novo codigo.", 400)
+    if attempts >= 5:
+        return json_error("Muitas tentativas. Solicite um novo codigo.", 429)
+    session["auth_code_attempts"] = attempts + 1
+    if len(code) != 6 or not hmac.compare_digest(_code_digest(email, code), str(session.get("auth_code_hash"))):
+        return json_error("Codigo invalido.", 401)
+    session["auth_email"] = email
+    session.pop("auth_pending_email", None)
+    session.pop("auth_code_hash", None)
+    session.pop("auth_code_expires", None)
+    session.pop("auth_code_attempts", None)
+    return {"ok": True, "email": email}
+
+
+@app.post("/api/auth/logout")
+def auth_logout():
+    session.clear()
+    return {"ok": True}
 
 
 def is_admin() -> bool:
@@ -744,6 +1001,8 @@ def health():
         "blobOk": blob["ok"],
         "blobError": blob["error"],
         "persistenceMode": persistence_mode,
+        "authEnabled": auth_enabled(),
+        "authConfigured": auth_configured(),
     }
 
 

@@ -118,6 +118,8 @@ Cada nova geracao cria um arquivo novo. Versoes antigas nao sao sobrescritas.
 - `FRETELAB_SECRET_KEY`: chave de sessao Flask recomendada para producao
 - `DATABASE_URL`: conexao Postgres do Supabase para historico, bases e auditoria
 - `BLOB_READ_WRITE_TOKEN`: token do Vercel Blob para arquivos ADM, backups e exports opcionais
+- `FRETELAB_LOGIN_EMAIL` e `FRETELAB_LOGIN_PASSWORD`: login basico da aplicacao
+- `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`: envio do codigo de 6 digitos por email
 
 ## Logs
 

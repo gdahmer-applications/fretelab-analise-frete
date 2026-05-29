@@ -13,12 +13,41 @@ DATABASE_URL=postgresql://postgres:<password>@<host>:5432/postgres?sslmode=requi
 BLOB_READ_WRITE_TOKEN=<token do Vercel Blob>
 FRETELAB_SECRET_KEY=<chave forte>
 FRETELAB_ADMIN_PASSWORD=<senha forte>
+FRETELAB_AUTH_ENABLED=1
+FRETELAB_LOGIN_EMAIL=<email autorizado>
+FRETELAB_LOGIN_PASSWORD=<senha de login>
+FRETELAB_AUTH_CODE_TTL_SECONDS=600
+SMTP_HOST=<host smtp>
+SMTP_PORT=587
+SMTP_USERNAME=<usuario smtp>
+SMTP_PASSWORD=<senha smtp>
+SMTP_FROM=<remetente>
+SMTP_USE_TLS=1
 MAX_UPLOAD_MB=30
 FLASK_DEBUG=0
 ENABLE_CEP_API=1
 ```
 
 `SUPABASE_URL` e `SUPABASE_SERVICE_ROLE_KEY` podem ficar cadastradas para automacoes futuras, mas a aplicacao usa `DATABASE_URL` no backend. Nunca exponha service role key no frontend.
+
+## Login da aplicacao
+
+Por padrao, a aplicacao exige login antes de abrir qualquer rota da interface ou API. O acesso basico usa:
+
+- `FRETELAB_LOGIN_EMAIL`
+- `FRETELAB_LOGIN_PASSWORD`
+- codigo de 6 digitos enviado por SMTP
+
+Tambem e possivel cadastrar multiplos usuarios em `FRETELAB_AUTH_USERS` como JSON:
+
+```json
+{
+  "pessoa1@empresa.com": "senha-forte-1",
+  "pessoa2@empresa.com": "senha-forte-2"
+}
+```
+
+Se SMTP nao estiver configurado em producao, o login retorna erro e nao libera acesso. Em desenvolvimento local, o codigo pode ser registrado no log quando `SMTP_HOST` estiver ausente.
 
 ## Criacao do banco
 
@@ -61,6 +90,7 @@ Na Vercel, Functions tem limite de payload de 4,5 MB. Uploads maiores que isso d
 
 - `databaseConfigured` e `databaseOk`
 - `blobConfigured` e `blobOk`
+- `authEnabled` e `authConfigured`
 - `persistenceMode`
 
 Valores esperados em producao:
